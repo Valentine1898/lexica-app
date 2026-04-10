@@ -122,7 +122,7 @@ export interface WordRow {
   phonetic: string | null;
   audio_url: string | null;
   ukrainian_translation: string | null;
-  definition: string;
+  definition: string | null;
   part_of_speech: string | null;
   frequency_rank: number | null;
   examples: string | null;

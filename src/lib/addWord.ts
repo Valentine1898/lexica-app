@@ -45,75 +45,132 @@ async function fetchTranslation(word: string): Promise<string | null> {
   } catch { return null; }
 }
 
+export interface WordEntry {
+  english: string;
+  translation?: string;
+}
+
 export interface AddWordResult {
   word: string;
   status: 'added' | 'duplicate' | 'not_found' | 'error';
   phonetic?: string | null;
-  definition?: string;
+  definition?: string | null;
   partOfSpeech?: string | null;
   frequencyRank?: number;
   examples?: string[];
   ukrainianTranslation?: string | null;
 }
 
-export async function addWordForUser(word: string, userId: number): Promise<AddWordResult> {
-  const normalizedWord = word.trim().toLowerCase();
-
-  const db = getDb();
-  const existing = await db.execute({
-    sql: 'SELECT id FROM words WHERE word = ? AND user_id = ?',
-    args: [normalizedWord, userId],
-  });
-  if (existing.rows.length > 0) return { word: normalizedWord, status: 'duplicate' };
-
-  try {
-    const [dictData, translation] = await Promise.all([
-      fetchDictionaryData(normalizedWord),
-      fetchTranslation(normalizedWord),
-    ]);
-    const frequencyRank = Math.floor(Math.random() * 15000) + 1;
-    const wordId = await insertWord({
-      word: normalizedWord,
-      user_id: userId,
-      phonetic: dictData.phonetic,
-      audio_url: dictData.audioUrl,
-      definition: dictData.definition,
-      part_of_speech: dictData.partOfSpeech,
-      frequency_rank: frequencyRank,
-      examples: JSON.stringify(dictData.examples),
-      ukrainian_translation: translation,
-    });
-    const today = new Date().toISOString().split('T')[0];
-    await insertReview(wordId, today);
-    return {
-      word: normalizedWord,
-      status: 'added',
-      phonetic: dictData.phonetic,
-      definition: dictData.definition,
-      partOfSpeech: dictData.partOfSpeech,
-      frequencyRank,
-      examples: dictData.examples,
-      ukrainianTranslation: translation,
-    };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : '';
-    return { word: normalizedWord, status: message.includes('not found') ? 'not_found' : 'error' };
-  }
-}
-
-// Extract all English words from arbitrary text, ignoring translations/other languages.
-// Returns deduplicated lowercase words, max 20.
-export function extractEnglishWords(text: string): string[] {
-  const tokens = text.split(/[^a-zA-Z]+/);
+// Parse text in "english — translation" format, extracting phrases and words.
+// Falls back to individual word extraction if no dash pattern found.
+export function parseVocabText(text: string): WordEntry[] {
+  const lines = text.split('\n');
+  const results: WordEntry[] = [];
   const seen = new Set<string>();
-  const words: string[] = [];
+
+  const hasDashFormat = lines.some(l => /[—–]/.test(l));
+
+  if (hasDashFormat) {
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed === '---') continue;
+
+      // Match "english words/phrase — translation"
+      const match = trimmed.match(/^([a-zA-Z][a-zA-Z\s]*)[\s]*[—–][\s]*(.+)$/);
+      if (match) {
+        const english = match[1].trim().toLowerCase().replace(/\s+/g, ' ');
+        const translation = match[2].trim();
+        if (english.length >= 2 && !seen.has(english)) {
+          seen.add(english);
+          results.push({ english, translation });
+          if (results.length >= 30) break;
+        }
+      }
+    }
+    if (results.length > 0) return results;
+  }
+
+  // Fallback: extract individual English words (letters only, min length 2)
+  const tokens = text.split(/[^a-zA-Z]+/);
   for (const token of tokens) {
     const w = token.toLowerCase();
     if (w.length >= 2 && !seen.has(w)) {
       seen.add(w);
-      words.push(w);
+      results.push({ english: w });
+      if (results.length >= 20) break;
     }
-    if (words.length >= 20) break;
   }
-  return words;
+  return results;
+}
+
+export async function addWordForUser(
+  english: string,
+  userId: number,
+  providedTranslation?: string
+): Promise<AddWordResult> {
+  const normalized = english.trim().toLowerCase().replace(/\s+/g, ' ');
+  const isPhrase = normalized.includes(' ');
+
+  const db = getDb();
+  const existing = await db.execute({
+    sql: 'SELECT id FROM words WHERE word = ? AND user_id = ?',
+    args: [normalized, userId],
+  });
+  if (existing.rows.length > 0) return { word: normalized, status: 'duplicate' };
+
+  let phonetic: string | null = null;
+  let audioUrl: string | null = null;
+  let definition: string | null = null;
+  let partOfSpeech: string | null = null;
+  let examples: string[] = [];
+  let translation: string | null = providedTranslation ?? null;
+
+  if (isPhrase) {
+    // Phrases: skip dictionary API, use provided translation
+    // If no translation provided, try to fetch one
+    if (!translation) translation = await fetchTranslation(normalized).catch(() => null);
+  } else {
+    // Single word: full dictionary lookup
+    try {
+      const [dictData, fetchedTranslation] = await Promise.all([
+        fetchDictionaryData(normalized),
+        translation ? Promise.resolve(null) : fetchTranslation(normalized),
+      ]);
+      phonetic = dictData.phonetic;
+      audioUrl = dictData.audioUrl;
+      definition = dictData.definition;
+      partOfSpeech = dictData.partOfSpeech;
+      examples = dictData.examples;
+      if (!translation) translation = fetchedTranslation;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '';
+      return { word: normalized, status: message.includes('not found') ? 'not_found' : 'error' };
+    }
+  }
+
+  const frequencyRank = Math.floor(Math.random() * 15000) + 1;
+  const wordId = await insertWord({
+    word: normalized,
+    user_id: userId,
+    phonetic,
+    audio_url: audioUrl,
+    definition,
+    part_of_speech: partOfSpeech,
+    frequency_rank: frequencyRank,
+    examples: JSON.stringify(examples),
+    ukrainian_translation: translation,
+  });
+  const today = new Date().toISOString().split('T')[0];
+  await insertReview(wordId, today);
+
+  return {
+    word: normalized,
+    status: 'added',
+    phonetic,
+    definition,
+    partOfSpeech,
+    frequencyRank,
+    examples,
+    ukrainianTranslation: translation,
+  };
 }

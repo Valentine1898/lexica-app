@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getOrCreateUser, initDb } from '@/lib/db';
-import { addWordForUser, extractEnglishWords } from '@/lib/addWord';
+import { addWordForUser, parseVocabText } from '@/lib/addWord';
 
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
 
@@ -50,9 +50,9 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ ok: true });
     }
 
-    // Extract English words from whatever the user sent
-    const words = extractEnglishWords(trimmed);
-    if (words.length === 0) return NextResponse.json({ ok: true });
+    // Parse entries from the message (phrases + words, with or without translations)
+    const entries = parseVocabText(trimmed);
+    if (entries.length === 0) return NextResponse.json({ ok: true });
 
     // Get (or create) app user
     await initDb();
@@ -62,34 +62,38 @@ export async function POST(request: NextRequest) {
     if (!telegramUserId) return NextResponse.json({ ok: true });
     const appUserId = await getOrCreateUser(telegramUserId, firstName, username);
 
-    // Single word → detailed response
-    if (words.length === 1) {
-      const result = await addWordForUser(words[0], appUserId);
+    // Single entry → detailed response
+    if (entries.length === 1) {
+      const { english, translation } = entries[0];
+      const result = await addWordForUser(english, appUserId, translation);
+      const isPhrase = english.includes(' ');
 
       if (result.status === 'duplicate') {
-        await sendMessage(chatId, `<b>${words[0]}</b> is already in your vocabulary list.`);
+        await sendMessage(chatId, `<b>${english}</b> is already in your vocabulary list.`);
       } else if (result.status === 'not_found') {
-        await sendMessage(chatId, `Word "<b>${words[0]}</b>" was not found in the dictionary.`);
+        await sendMessage(chatId, `"<b>${english}</b>" was not found in the dictionary.`);
       } else if (result.status === 'added') {
         const { word, phonetic, ukrainianTranslation, frequencyRank, definition, examples } = result;
         let reply = `<b>${word}</b>`;
         if (phonetic) reply += `  <i>${phonetic}</i>`;
         if (ukrainianTranslation) reply += `\n🇺🇦 <b>${ukrainianTranslation}</b>`;
-        if (frequencyRank) reply += `\n${frequencyBadge(frequencyRank)}`;
-        reply += `\n\n${definition}`;
+        if (frequencyRank && !isPhrase) reply += `\n${frequencyBadge(frequencyRank)}`;
+        if (definition) reply += `\n\n${definition}`;
         if (examples?.length) {
           reply += '\n\n<b>Examples:</b>';
           for (const ex of examples) reply += `\n• ${ex}`;
         }
         await sendMessage(chatId, reply);
       } else {
-        await sendMessage(chatId, `Failed to add <b>${words[0]}</b>.`);
+        await sendMessage(chatId, `Failed to add <b>${english}</b>.`);
       }
       return NextResponse.json({ ok: true });
     }
 
-    // Multiple words → add all in parallel, send summary
-    const results = await Promise.all(words.map(w => addWordForUser(w, appUserId)));
+    // Multiple entries → add all in parallel, send summary
+    const results = await Promise.all(
+      entries.map(({ english, translation }) => addWordForUser(english, appUserId, translation))
+    );
 
     const added = results.filter(r => r.status === 'added');
     const duplicates = results.filter(r => r.status === 'duplicate');
@@ -98,19 +102,18 @@ export async function POST(request: NextRequest) {
     let reply = '';
 
     if (added.length > 0) {
-      reply += `✅ <b>Added ${added.length} word${added.length > 1 ? 's' : ''}:</b>\n`;
+      const label = added.length === 1 ? 'word' : 'words';
+      reply += `✅ <b>Added ${added.length} ${label}:</b>\n`;
       for (const r of added) {
         reply += `• <b>${r.word}</b>`;
         if (r.ukrainianTranslation) reply += ` — ${r.ukrainianTranslation}`;
         reply += '\n';
       }
     }
-
     if (duplicates.length > 0) {
       if (reply) reply += '\n';
       reply += `⚠️ Already in vocab: ${duplicates.map(r => r.word).join(', ')}`;
     }
-
     if (notFound.length > 0) {
       if (reply) reply += '\n';
       reply += `❌ Not found: ${notFound.map(r => r.word).join(', ')}`;
