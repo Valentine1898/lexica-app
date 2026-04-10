@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 
 interface FlipCardProps {
   word: string;
@@ -84,25 +84,6 @@ export default function FlipCard({
     setIsFlipped((prev) => !prev);
   }, []);
 
-  const handleSpeak = useCallback(
-    (e: React.MouseEvent) => {
-      e.stopPropagation();
-
-      // Try audio URL first
-      if (audioUrl) {
-        const audio = new Audio(audioUrl);
-        audio.play().catch(() => {
-          // Fall back to Web Speech API
-          speakWithWebSpeech();
-        });
-        return;
-      }
-
-      speakWithWebSpeech();
-    },
-    [audioUrl, word]
-  );
-
   const speakWithWebSpeech = useCallback(() => {
     if ('speechSynthesis' in window) {
       window.speechSynthesis.cancel();
@@ -118,6 +99,29 @@ export default function FlipCard({
       window.speechSynthesis.speak(utterance);
     }
   }, [word]);
+
+  const playAudio = useCallback(() => {
+    if (audioUrl) {
+      const audio = new Audio(audioUrl);
+      setIsSpeaking(true);
+      audio.play()
+        .then(() => { audio.onended = () => setIsSpeaking(false); })
+        .catch(() => { setIsSpeaking(false); speakWithWebSpeech(); });
+    } else {
+      speakWithWebSpeech();
+    }
+  }, [audioUrl, speakWithWebSpeech]);
+
+  const handleSpeak = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    playAudio();
+  }, [playAudio]);
+
+  // Autoplay on card mount (slight delay for render)
+  useEffect(() => {
+    const t = setTimeout(playAudio, 300);
+    return () => clearTimeout(t);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleRate = useCallback(
     (e: React.MouseEvent, quality: number) => {
